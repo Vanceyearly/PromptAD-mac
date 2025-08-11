@@ -155,47 +155,6 @@ class PromptLearner(nn.Module):
         return normal_prompts, abnormal_prompts_handle, abnormal_prompts_learned
 
 
-class CrossModalFusion(nn.Module):
-    """跨模态融合模块，用于融合视觉和文本特征"""
-    def __init__(self, vision_dim, text_dim, fusion_dim, num_heads=8):
-        super(CrossModalFusion, self).__init__()
-        self.vision_proj = nn.Linear(vision_dim, fusion_dim)
-        self.text_proj = nn.Linear(text_dim, fusion_dim)
-        
-        # 跨模态注意力机制
-        self.cross_attn = nn.MultiheadAttention(fusion_dim, num_heads)
-        self.norm1 = nn.LayerNorm(fusion_dim)
-        self.norm2 = nn.LayerNorm(fusion_dim)
-        
-        # 融合后的特征投影
-        self.fusion_proj = nn.Sequential(
-            nn.Linear(fusion_dim, fusion_dim),
-            nn.GELU(),
-            nn.Linear(fusion_dim, fusion_dim)
-        )
-    
-    def forward(self, vision_features, text_features):
-        # 投影到相同的特征空间
-        vision_proj = self.vision_proj(vision_features)
-        text_proj = self.text_proj(text_features)
-        
-        # 视觉特征作为查询，文本特征作为键和值
-        vision_proj = vision_proj.permute(1, 0, 2)  # [B, N, D] -> [N, B, D]
-        text_proj = text_proj.permute(1, 0, 2)      # [B, M, D] -> [M, B, D]
-        
-        # 跨模态注意力
-        attn_output, _ = self.cross_attn(vision_proj, text_proj, text_proj)
-        attn_output = attn_output.permute(1, 0, 2)  # [N, B, D] -> [B, N, D]
-        
-        # 残差连接和层归一化
-        fusion_features = self.norm1(vision_proj.permute(1, 0, 2) + attn_output)
-        
-        # 前馈网络
-        fusion_output = self.fusion_proj(fusion_features)
-        fusion_output = self.norm2(fusion_features + fusion_output)
-        
-        return fusion_output
-
 class PromptAD(torch.nn.Module):
     def __init__(self, out_size_h, out_size_w, device, backbone, pretrained_dataset, n_ctx, n_pro, n_ctx_ab, n_pro_ab, class_name,  precision='fp16', **kwargs):
         '''
@@ -223,9 +182,6 @@ class PromptAD(torch.nn.Module):
         # version v1:    norm for each of linguistic embedding
         self.version = 'V1' # V1:
         # visual textual, textual_visual
-        
-        # 是否启用跨模态融合
-        self.use_cross_modal_fusion = kwargs.get('use_cross_modal_fusion', True)
 
         self.transform = transforms.Compose([
             transforms.Resize((kwargs['img_resize'], kwargs['img_resize']), Image.BICUBIC),
@@ -250,21 +206,6 @@ class PromptAD(torch.nn.Module):
 
         self.prompt_learner = PromptLearner(n_ctx, n_pro, n_ctx_ab, n_pro_ab, class_name, model, self.precision)
         self.model = model.to(self.device)
-
-        # 添加跨模态融合模块
-        vision_dim = model.visual.output_dim
-        text_dim = model.visual.output_dim  # 通常CLIP中视觉和文本特征维度相同
-        fusion_dim = vision_dim
-        self.cross_modal_fusion = CrossModalFusion(vision_dim, text_dim, fusion_dim).to(self.device)
-        
-        # 添加融合特征的投影层
-        self.fusion_to_vision = nn.Linear(fusion_dim, vision_dim).to(self.device)
-        self.fusion_to_text = nn.Linear(fusion_dim, text_dim).to(self.device)
-        
-        if self.precision == 'fp16':
-            self.cross_modal_fusion = self.cross_modal_fusion.half()
-            self.fusion_to_vision = self.fusion_to_vision.half()
-            self.fusion_to_text = self.fusion_to_text.half()
 
         self.tokenizer = tokenizer
         self.normal_text_features = None
@@ -295,46 +236,21 @@ class PromptAD(torch.nn.Module):
 
     @torch.no_grad()
     def encode_image(self, image: torch.Tensor):
+
         if self.precision == "fp16":
             image = image.half()
         image_features = self.model.encode_image(image)
         return [f / f.norm(dim=-1, keepdim=True) for f in image_features]
-    
+
     @torch.no_grad()
     def encode_text(self, text: torch.Tensor):
         text_features = self.model.encode_text(text)
+        # return [f / f.norm(dim=-1, keepdim=True) for f in text_features]
         return text_features
 
     def encode_text_embedding(self, text_embedding, original_tokens):
         text_features = self.model.encode_text_embeddings(text_embedding, original_tokens)
         return text_features
-        
-    def fuse_features(self, vision_features, text_features):
-        """融合视觉和文本特征"""
-        if not self.use_cross_modal_fusion:
-            return vision_features, text_features
-            
-        # 提取全局特征和局部特征
-        vision_global = vision_features[0]  # 全局视觉特征 [B, D]
-        vision_local = vision_features[1]   # 局部视觉特征 [B, N, D]
-        
-        # 确保文本特征形状正确
-        if len(text_features.shape) == 2:  # [B, D]
-            text_features = text_features.unsqueeze(1)  # [B, 1, D]
-        
-        # 对局部视觉特征和文本特征进行融合
-        fused_local_features = self.cross_modal_fusion(vision_local, text_features)
-        
-        # 将融合特征投影回原始特征空间
-        fused_vision_local = self.fusion_to_vision(fused_local_features)
-        
-        # 计算全局特征的融合版本（简单平均池化）
-        fused_vision_global = torch.mean(fused_vision_local, dim=1)
-        
-        # 返回融合后的特征，保持与原始特征相同的结构
-        fused_vision_features = [fused_vision_global] + [fused_vision_local] + vision_features[2:]
-        
-        return fused_vision_features, text_features
 
     @torch.no_grad()
     def build_text_feature_gallery(self):
@@ -359,10 +275,6 @@ class PromptAD(torch.nn.Module):
             abnormal_text_features = torch.cat(abnormal_text_features, 0).half()
         else:
             raise NotImplementedError
-
-        # 保存原始文本特征，用于后续融合
-        self.normal_text_features_raw = normal_text_features
-        self.abnormal_text_features_raw = abnormal_text_features
 
         avr_normal_text_features = torch.mean(normal_text_features, dim=0, keepdim=True)
         avr_abnormal_text_features = torch.mean(abnormal_text_features, dim=0, keepdim=True)
@@ -430,48 +342,14 @@ class PromptAD(torch.nn.Module):
         return score.reshape((N, self.grid_size[0], self.grid_size[1])).unsqueeze(1)
 
     def forward(self, images, task):
-        # 获取原始视觉特征
+
         visual_features = self.encode_image(images)
-        
-        # 如果启用了跨模态融合
-        if self.use_cross_modal_fusion:
-            # 对于分割任务，使用正常和异常文本特征进行融合
-            if task == 'seg':
-                # 创建批次大小的文本特征
-                batch_size = images.shape[0]
-                normal_text = self.text_features[0:1].expand(batch_size, -1)  # [B, D]
-                abnormal_text = self.text_features[1:2].expand(batch_size, -1)  # [B, D]
-                
-                # 分别与正常和异常文本特征融合
-                fused_normal_features, _ = self.fuse_features(visual_features, normal_text)
-                fused_abnormal_features, _ = self.fuse_features(visual_features, abnormal_text)
-                
-                # 计算融合后的异常分数
-                textual_anomaly_map = self.calculate_textual_anomaly_score(fused_normal_features, 'seg')
-                visual_anomaly_map = self.calculate_visual_anomaly_score(fused_abnormal_features)
-            else:  # 分类任务
-                # 创建批次大小的文本特征
-                batch_size = images.shape[0]
-                text_features = self.text_features.expand(batch_size, -1, -1)  # [B, 2, D]
-                
-                # 融合视觉和文本特征
-                fused_features, _ = self.fuse_features(visual_features, text_features)
-                
-                # 计算融合后的异常分数
-                textual_anomaly_map = self.calculate_textual_anomaly_score(fused_features, 'cls')
-                visual_anomaly_map = None  # 分类任务不需要视觉异常图
-        else:  # 不使用跨模态融合，使用原始方法
-            if task == 'seg':
-                textual_anomaly_map = self.calculate_textual_anomaly_score(visual_features, 'seg')
-                visual_anomaly_map = self.calculate_visual_anomaly_score(visual_features)
-            else:  # 分类任务
-                textual_anomaly_map = self.calculate_textual_anomaly_score(visual_features, 'cls')
-                visual_anomaly_map = None
-            # 只有在分割任务中才需要融合视觉和文本异常图
-            if task == 'seg':
-                anomaly_map = 1. / (1. / textual_anomaly_map + 1. / visual_anomaly_map)
-            else:  # 分类任务直接返回文本异常分数
-                return textual_anomaly_map
+        if task == 'seg':
+            textual_anomaly_map = self.calculate_textual_anomaly_score(visual_features, 'seg')
+
+            visual_anomaly_map = self.calculate_visual_anomaly_score(visual_features)
+            #
+            anomaly_map = 1. / (1. / textual_anomaly_map + 1. / visual_anomaly_map)
             # anomaly_map = 0.5 * (textual_anomaly_map + visual_anomaly_map)
             # anomaly_map = visual_anomaly_map
             # anomaly_map = textual_anomaly_map
