@@ -2,8 +2,8 @@ import numpy as np
 from torch.utils.data import DataLoader
 from loguru import logger
 
-# from .dataset import CLIPDataset
-from .dataset_anomaly import CLIPDataset
+from .dataset import CLIPDataset
+# from .dataset_anomaly import CLIPDataset
 from .mvtec import load_mvtec, mvtec_classes, load_mvtec_dtd
 from .visa import load_visa, visa_classes
 
