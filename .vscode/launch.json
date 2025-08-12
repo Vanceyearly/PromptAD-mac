@@ -8,7 +8,7 @@
             "name": "prompt_ad",
             "type": "python",
             "request": "launch",
-            "program": "${workspaceFolder}/train_cls_anomaly.py",
+            "program": "${workspaceFolder}/train_cls.py",
             "console": "integratedTerminal",
             "justMyCode": false,
             "pythonPath": "/Users/guojian.ye/miniconda3/envs/prompt_ad/bin/python",

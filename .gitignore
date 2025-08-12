@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 
@@ -205,6 +206,7 @@ Thumbs.db
 
 # CSV result files
 *.csv
+result/
 !**/seeds_*/*.txt  # Keep seed files
 
 # Cache directories
