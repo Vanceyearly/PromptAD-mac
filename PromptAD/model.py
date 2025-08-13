@@ -25,6 +25,115 @@ def _convert_to_rgb(image):
     return image.convert('RGB')
 
 
+class CrossModalAttention(nn.Module):
+    """跨模态注意力融合模块"""
+    def __init__(self, visual_dim, text_dim, hidden_dim=256, num_heads=8):
+        super().__init__()
+        self.visual_dim = visual_dim
+        self.text_dim = text_dim
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        
+        # 将视觉和文本特征投影到相同维度
+        self.visual_proj = nn.Linear(visual_dim, hidden_dim)
+        self.text_proj = nn.Linear(text_dim, hidden_dim)
+        
+        # 多头注意力机制
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=False  # 使用 seq_len, batch, embed_dim 格式
+        )
+        
+        # 层归一化
+        self.layer_norm1 = nn.LayerNorm(hidden_dim)
+        self.layer_norm2 = nn.LayerNorm(hidden_dim)
+        
+        # 前馈网络
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim * 2, hidden_dim)
+        )
+        
+    def forward(self, visual_features, text_features):
+        # 确保输入是3D张量 [B, N, D]
+        if len(visual_features.shape) == 2:
+            visual_features = visual_features.unsqueeze(1)  # [B, D] -> [B, 1, D]
+        if len(text_features.shape) == 2:
+            text_features = text_features.unsqueeze(1)      # [B, D] -> [B, 1, D]
+        
+        # 投影到相同维度
+        v_proj = self.visual_proj(visual_features)  # [B, N, hidden_dim]
+        t_proj = self.text_proj(text_features)      # [B, M, hidden_dim]
+        
+        # 转换为 [N, B, D] 格式 (batch_first=False)
+        v_proj = v_proj.transpose(0, 1)  # [N, B, hidden_dim]
+        t_proj = t_proj.transpose(0, 1)  # [M, B, hidden_dim]
+        
+        # 跨模态注意力：视觉特征作为query，文本特征作为key和value
+        v_attended, _ = self.multihead_attn(v_proj, t_proj, t_proj)
+        v_attended = self.layer_norm1(v_proj + v_attended)
+        
+        # 前馈网络
+        v_ff = self.ffn(v_attended)
+        v_output = self.layer_norm2(v_attended + v_ff)
+        
+        # 跨模态注意力：文本特征作为query，视觉特征作为key和value
+        t_attended, _ = self.multihead_attn(t_proj, v_proj, v_proj)
+        t_attended = self.layer_norm1(t_proj + t_attended)
+        
+        # 前馈网络
+        t_ff = self.ffn(t_attended)
+        t_output = self.layer_norm2(t_attended + t_ff)
+        
+        # 转换回 [B, N, D] 格式
+        v_output = v_output.transpose(0, 1)
+        t_output = t_output.transpose(0, 1)
+        
+        return v_output, t_output
+
+
+class FusionWeightNetwork(nn.Module):
+    """特征融合权重学习网络"""
+    def __init__(self, visual_dim, text_dim, hidden_dim=128):
+        super().__init__()
+        self.visual_dim = visual_dim
+        self.text_dim = text_dim
+        
+        # 权重预测网络
+        self.weight_net = nn.Sequential(
+            nn.Linear(visual_dim + text_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 2),  # 输出两个权重：视觉权重和文本权重
+            nn.Softmax(dim=-1)
+        )
+        
+    def forward(self, visual_features, text_features):
+        # 全局平均池化获得特征表示
+        if len(visual_features.shape) > 2:
+            v_global = visual_features.mean(dim=1)  # [B, visual_dim]
+        else:
+            v_global = visual_features
+            
+        if len(text_features.shape) > 2:
+            t_global = text_features.mean(dim=1)    # [B, text_dim]
+        else:
+            t_global = text_features
+            
+        # 拼接特征
+        combined = torch.cat([v_global, t_global], dim=-1)  # [B, visual_dim + text_dim]
+        
+        # 预测融合权重
+        weights = self.weight_net(combined)  # [B, 2]
+        
+        return weights[:, 0:1], weights[:, 1:2]  # 返回视觉权重和文本权重
+
+
 class PromptLearner(nn.Module):
     def __init__(self, n_ctx, n_pro, n_ctx_ab, n_pro_ab, classname, clip_model, pre):
         super().__init__()
@@ -182,6 +291,11 @@ class PromptAD(torch.nn.Module):
         # version v1:    norm for each of linguistic embedding
         self.version = 'V1' # V1:
         # visual textual, textual_visual
+        
+        # 添加可学习的视觉-文本融合模块
+        self.enable_fusion = kwargs.get('enable_fusion', True)
+        if self.enable_fusion:
+            self._init_fusion_modules()
 
         self.transform = transforms.Compose([
             transforms.Resize((kwargs['img_resize'], kwargs['img_resize']), Image.BICUBIC),
@@ -233,6 +347,58 @@ class PromptAD(torch.nn.Module):
         self.tokenized_abnormal_prompts_handle = self.prompt_learner.tokenized_abnormal_prompts_handle
         self.tokenized_abnormal_prompts_learned = self.prompt_learner.tokenized_abnormal_prompts_learned
         self.tokenized_abnormal_prompts = torch.cat([self.tokenized_abnormal_prompts_handle, self.tokenized_abnormal_prompts_learned], dim=0)
+    
+    def _init_fusion_modules(self):
+        """初始化视觉-文本融合模块"""
+        # 根据实际测试，视觉特征维度情况：
+        # - pooled特征: 640维
+        # - tokens特征: 640维 (feature1) 和 896维 (feature2, feature3)
+        # - 文本特征: 640维
+        text_dim = 640  # 文本特征维度
+        
+        print(f"初始化融合模块 - 文本维度: {text_dim}")
+        
+        # 为不同维度的视觉特征创建不同的跨模态注意力模块
+        # 640维特征的融合模块 (用于pooled和tokens特征)
+        self.cross_modal_attention_640 = CrossModalAttention(
+            visual_dim=640,
+            text_dim=text_dim,
+            hidden_dim=256,
+            num_heads=8
+        ).to(self.device)
+        
+        # 896维特征的融合模块 (用于feature2和feature3)
+        self.cross_modal_attention_896 = CrossModalAttention(
+            visual_dim=896,
+            text_dim=text_dim,
+            hidden_dim=256,
+            num_heads=8
+        ).to(self.device)
+        
+        # 特征融合权重学习模块 (为不同维度创建)
+        self.fusion_weight_net_640 = FusionWeightNetwork(
+            visual_dim=640,
+            text_dim=text_dim,
+            hidden_dim=128
+        ).to(self.device)
+        
+        self.fusion_weight_net_896 = FusionWeightNetwork(
+            visual_dim=896,
+            text_dim=text_dim,
+            hidden_dim=128
+        ).to(self.device)
+        
+        # 融合后的特征投影层 (注意：CrossModalAttention输出256维，所以拼接后是512维)
+        self.fused_projection_640 = nn.Linear(256 + 256, 640).to(self.device)  # 256+256=512 -> 640
+        self.fused_projection_896 = nn.Linear(256 + 256, 896).to(self.device)  # 256+256=512 -> 896
+        
+        if self.precision == 'fp16':
+            self.cross_modal_attention_640 = self.cross_modal_attention_640.half()
+            self.cross_modal_attention_896 = self.cross_modal_attention_896.half()
+            self.fusion_weight_net_640 = self.fusion_weight_net_640.half()
+            self.fusion_weight_net_896 = self.fusion_weight_net_896.half()
+            self.fused_projection_640 = self.fused_projection_640.half()
+            self.fused_projection_896 = self.fused_projection_896.half()
 
     @torch.no_grad()
     def encode_image(self, image: torch.Tensor):
@@ -241,6 +407,138 @@ class PromptAD(torch.nn.Module):
             image = image.half()
         image_features = self.model.encode_image(image)
         return [f / f.norm(dim=-1, keepdim=True) for f in image_features]
+    
+    @torch.no_grad()
+    def encode_fused_features(self, image: torch.Tensor, use_fusion=True):
+        """使用视觉-文本融合的特征编码方法"""
+        if not self.enable_fusion or not use_fusion:
+            return self.encode_image(image)
+            
+        if self.precision == "fp16":
+            image = image.half()
+            
+        # 获取原始视觉特征
+        visual_features = self.model.encode_image(image)  # [pooled, tokens, feature1, feature2]
+        
+        # 获取文本特征（正常和异常）
+        normal_text_embeddings, abnormal_text_embeddings_handle, abnormal_text_embeddings_learned = self.prompt_learner()
+        
+        # 编码文本特征
+        normal_text_features = self.encode_text_embedding(normal_text_embeddings, self.tokenized_normal_prompts)
+        abnormal_text_features_handle = self.encode_text_embedding(abnormal_text_embeddings_handle, self.tokenized_abnormal_prompts_handle)
+        abnormal_text_features_learned = self.encode_text_embedding(abnormal_text_embeddings_learned, self.tokenized_abnormal_prompts_learned)
+        
+        # 合并异常文本特征
+        abnormal_text_features = torch.cat([abnormal_text_features_handle, abnormal_text_features_learned], dim=0)
+        
+        # 对每个视觉特征层进行融合
+        fused_features = []
+        
+        for i, v_feat in enumerate(visual_features):
+            if i == 0:  # pooled features
+                # 使用正常文本特征进行融合
+                text_feat = normal_text_features.mean(dim=0, keepdim=True)  # 平均池化多个prompt
+                
+                # 扩展文本特征维度以匹配视觉特征
+                if len(v_feat.shape) == 3:  # [B, N, D]
+                    text_feat = text_feat.unsqueeze(1).expand(-1, v_feat.shape[1], -1)
+                elif len(v_feat.shape) == 2:  # [B, D]
+                    text_feat = text_feat.expand(v_feat.shape[0], -1)
+                
+                # 根据特征维度选择对应的融合模块
+                feat_dim = v_feat.shape[-1]
+                if feat_dim == 640:
+                    cross_attention = self.cross_modal_attention_640
+                    fusion_weight_net = self.fusion_weight_net_640
+                    projection = self.fused_projection_640
+                elif feat_dim == 896:
+                    cross_attention = self.cross_modal_attention_896
+                    fusion_weight_net = self.fusion_weight_net_896
+                    projection = self.fused_projection_896
+                else:
+                    raise ValueError(f"不支持的特征维度: {feat_dim}")
+                    
+                # 跨模态注意力融合
+                v_fused, t_fused = cross_attention(v_feat.unsqueeze(1) if len(v_feat.shape) == 2 else v_feat, 
+                                                 text_feat.unsqueeze(1) if len(text_feat.shape) == 2 else text_feat)
+                
+                # 学习融合权重
+                v_weight, t_weight = fusion_weight_net(v_feat, text_feat)
+                
+                # 处理注意力输出维度
+                if len(v_feat.shape) == 2:
+                    v_fused = v_fused.squeeze(1)
+                    t_fused = t_fused.squeeze(1)
+                else:
+                    # 对于3D特征，取平均
+                    v_fused = v_fused.mean(1)
+                    t_fused = t_fused.mean(1)
+                
+                # 特征拼接和投影
+                combined_feat = torch.cat([v_fused, t_fused], dim=-1)
+                projected_feat = projection(combined_feat)
+                
+                # 应用融合权重
+                if len(v_feat.shape) == 3:  # 对于tokens特征，需要扩展维度
+                    projected_feat = projected_feat.unsqueeze(1).expand(-1, v_feat.shape[1], -1)
+                    v_weight = v_weight.unsqueeze(1).expand(-1, v_feat.shape[1], -1)
+                    t_weight = t_weight.unsqueeze(1).expand(-1, v_feat.shape[1], -1)
+                
+                fused_feat = v_weight * projected_feat + (1 - v_weight - t_weight) * v_feat
+                    
+            else:  # tokens, feature1, feature2
+                # 对于其他特征，使用异常文本特征进行融合
+                text_feat = abnormal_text_features.mean(dim=0, keepdim=True)
+                
+                # 扩展文本特征到batch维度，但保持2D用于注意力计算
+                text_feat = text_feat.expand(v_feat.shape[0], -1)  # [B, D]
+                
+                # 根据特征维度选择对应的融合模块
+                feat_dim = v_feat.shape[-1]
+                if feat_dim == 640:
+                    cross_attention = self.cross_modal_attention_640
+                    fusion_weight_net = self.fusion_weight_net_640
+                    projection = self.fused_projection_640
+                elif feat_dim == 896:
+                    cross_attention = self.cross_modal_attention_896
+                    fusion_weight_net = self.fusion_weight_net_896
+                    projection = self.fused_projection_896
+                else:
+                    raise ValueError(f"不支持的特征维度: {feat_dim}")
+                    
+                # 跨模态注意力融合
+                v_fused, t_fused = cross_attention(v_feat,  # 保持原始形状
+                                                 text_feat)  # [B, D]
+                
+                # 学习融合权重
+                v_weight, t_weight = fusion_weight_net(v_feat, text_feat)
+                
+                # 处理注意力输出维度
+                if len(v_feat.shape) == 2:
+                    v_fused = v_fused.squeeze(1)
+                    t_fused = t_fused.squeeze(1)
+                else:
+                    # 对于3D特征，取平均
+                    v_fused = v_fused.mean(1)
+                    t_fused = t_fused.mean(1)
+                
+                # 特征拼接和投影
+                combined_feat = torch.cat([v_fused, t_fused], dim=-1)
+                projected_feat = projection(combined_feat)
+                
+                # 应用融合权重
+                if len(v_feat.shape) == 3:  # 对于tokens特征，需要扩展维度
+                    projected_feat = projected_feat.unsqueeze(1).expand(-1, v_feat.shape[1], -1)
+                    v_weight = v_weight.unsqueeze(1).expand(-1, v_feat.shape[1], -1)
+                    t_weight = t_weight.unsqueeze(1).expand(-1, v_feat.shape[1], -1)
+                
+                fused_feat = v_weight * projected_feat + (1 - v_weight - t_weight) * v_feat
+            
+            # 归一化
+            fused_feat = fused_feat / fused_feat.norm(dim=-1, keepdim=True)
+            fused_features.append(fused_feat)
+            
+        return fused_features
 
     @torch.no_grad()
     def encode_text(self, text: torch.Tensor):
@@ -341,9 +639,18 @@ class PromptAD(torch.nn.Module):
 
         return score.reshape((N, self.grid_size[0], self.grid_size[1])).unsqueeze(1)
 
-    def forward(self, images, task):
-
-        visual_features = self.encode_image(images)
+    def forward(self, images, task, use_fusion=None):
+        """前向传播，支持融合特征"""
+        # 如果未指定use_fusion，则根据enable_fusion决定
+        if use_fusion is None:
+            use_fusion = self.enable_fusion
+            
+        # 使用融合特征编码或传统编码
+        if use_fusion and self.enable_fusion:
+            visual_features = self.encode_fused_features(images, use_fusion=True)
+        else:
+            visual_features = self.encode_image(images)
+            
         if task == 'seg':
             textual_anomaly_map = self.calculate_textual_anomaly_score(visual_features, 'seg')
 

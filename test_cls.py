@@ -138,6 +138,8 @@ def get_args():
     parser.add_argument("--n_pro", type=int, default=1)
     parser.add_argument("--n_pro_ab", type=int, default=4)
 
+    parser.add_argument("-a", type=float, default=0.5)
+
     args = parser.parse_args()
 
     return args
