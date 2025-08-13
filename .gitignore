@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 **/__pycache__/
+**/**/__pycache__/
 *.py[cod]
 *$py.class
 
@@ -184,6 +185,7 @@ events.out.tfevents.*
 
 # IDE and Editor files
 .vscode/
+.vscode1/
 .idea/
 *.swp
 *.swo

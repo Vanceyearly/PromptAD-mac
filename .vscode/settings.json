@@ -1,6 +1,0 @@
-{
-    "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python-envs.pythonProjects": [],
-    "python.pythonPath": "/Users/guojian.ye/miniconda3/envs/prompt_ad/bin/python",
-}
