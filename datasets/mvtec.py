@@ -6,7 +6,7 @@ import random
 #                    'bottle', 'cable', 'capsule', 'hazelnut', 'metal_nut', 'pill',
 #                    'screw', 'toothbrush', 'transistor', 'zipper']
 
-mvtec_classes = ['cable','leather', 'wood', 'capsule', 
+mvtec_classes = ['cable','carpet','leather', 'wood', 'capsule', 
                    'screw','transistor', 'zipper']
 
 MVTEC2D_DIR = './anomaly_detection/mvtec_anomaly_detection'
