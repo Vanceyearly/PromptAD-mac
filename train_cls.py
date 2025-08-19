@@ -72,6 +72,7 @@ def fit(model,
             optimizer.zero_grad()
 
             normal_text_features = model.encode_text_embedding(normal_text_prompt, model.tokenized_normal_prompts)
+            # n_text_pooled, n_text_tokens, n_text_features_1, n_text_features_2 = model.model.text(normal_text_prompt)
 
             abnormal_text_features_handle = model.encode_text_embedding(abnormal_text_prompt_handle, model.tokenized_abnormal_prompts_handle)
             abnormal_text_features_learned = model.encode_text_embedding(abnormal_text_prompt_learned, model.tokenized_abnormal_prompts_learned)
@@ -121,7 +122,7 @@ def fit(model,
             loss.backward()
             optimizer.step()
 
-            print(f"label: {label}, epoch: {epoch}, loss: {loss.item()}")
+            print(f"label: {args.class_name}, epoch: {epoch}, loss: {loss.item()}")
         scheduler.step()
         model.build_text_feature_gallery()
 
@@ -154,12 +155,45 @@ def fit(model,
 
         test_imgs, score_maps, gt_mask_list = specify_resolution(test_imgs, score_maps, gt_mask_list, resolution=(args.resolution, args.resolution))
         result_dict = metric_cal_img(np.array(scores_img), gt_list, np.array(score_maps))
+        
+        # 如果启用了分类指标，计算额外的分类指标
+        if args.use_classification_metrics:
+            from utils.metrics import metric_cal_img_classification
+            classification_result_dict = metric_cal_img_classification(np.array(scores_img), gt_list, np.array(score_maps))
+            
+            # 打印所有指标
+            print(f"Epoch {epoch} - Classification Metrics:")
+            print(f"  ROC AUC: {classification_result_dict['i_roc']:.2f}%")
+            print(f"  Accuracy: {classification_result_dict['accuracy']:.2f}%")
+            print(f"  Precision: {classification_result_dict['precision']:.2f}%")
+            print(f"  Recall: {classification_result_dict['recall']:.2f}%")
+            print(f"  F1-Score: {classification_result_dict['f1_score']:.2f}%")
+            print(f"  PR AUC: {classification_result_dict['pr_auc']:.2f}%")
+            print(f"  Best Threshold: {classification_result_dict['best_threshold']:.4f}")
+            print(f"  TP:{classification_result_dict['tp']}, FP:{classification_result_dict['fp']}, TN:{classification_result_dict['tn']}, FN:{classification_result_dict['fn']}")
+            
+            # 将分类指标合并到result_dict中
+            result_dict.update(classification_result_dict)
 
         if best_result_dict is None:
             save_check_point(model, check_path)
             best_result_dict = result_dict
 
-        elif best_result_dict['i_roc'] < result_dict['i_roc']:
+        # 根据配置选择不同的指标作为模型选择标准
+        if args.model_selection_metric == 'roc_auc':
+            # 使用ROC AUC (原始方式)
+            should_save = best_result_dict['i_roc'] < result_dict['i_roc']
+        elif args.model_selection_metric == 'f1_score' and args.use_classification_metrics:
+            # 使用F1-Score作为标准
+            should_save = best_result_dict.get('f1_score', 0) < result_dict.get('f1_score', 0)
+        elif args.model_selection_metric == 'accuracy' and args.use_classification_metrics:
+            # 使用Accuracy作为标准
+            should_save = best_result_dict.get('accuracy', 0) < result_dict.get('accuracy', 0)
+        else:
+            # 默认使用ROC AUC
+            should_save = best_result_dict['i_roc'] < result_dict['i_roc']
+            
+        if should_save:
             save_check_point(model, check_path)
             best_result_dict = result_dict
 
@@ -203,9 +237,25 @@ def main(args):
     # as the pro metric calculation is costly, we only calculate it in the last evaluation
     metrics = fit(model, args, test_dataloader, device, check_path=check_path, train_data=train_dataloader)
 
+    # 输出最终结果
     i_roc = round(metrics['i_roc'], 2)
     object = kwargs['class_name']
-    print(f'Object:{object} =========================== Image-AUROC:{i_roc}\n')
+    print(f'Object:{object} =========================== Image-AUROC:{i_roc}')
+    
+    # 如果启用了分类指标，输出详细的分类结果
+    if kwargs.get('use_classification_metrics', False):
+        print(f'\n============= Detailed Classification Results for {object} =============')
+        print(f'ROC AUC: {metrics["i_roc"]:.2f}%')
+        if 'accuracy' in metrics:
+            print(f'Accuracy: {metrics["accuracy"]:.2f}%')
+            print(f'Precision: {metrics["precision"]:.2f}%')
+            print(f'Recall: {metrics["recall"]:.2f}%')
+            print(f'F1-Score: {metrics["f1_score"]:.2f}%')
+            print(f'PR AUC: {metrics["pr_auc"]:.2f}%')
+            print(f'Best Threshold: {metrics["best_threshold"]:.4f}')
+            print(f'Confusion Matrix - TP:{metrics["tp"]}, FP:{metrics["fp"]}, TN:{metrics["tn"]}, FN:{metrics["fn"]}')
+        print('=' * 70)
+    print()
 
     save_metric(metrics, dataset_classes[kwargs['dataset']], kwargs['class_name'],
                 kwargs['dataset'], csv_path)
@@ -257,6 +307,13 @@ def get_args():
 
     # loss hyper parameter
     parser.add_argument("--lambda1", type=float, default=0.001)
+
+    # classification metrics options
+    parser.add_argument("--use-classification-metrics", type=str2bool, default=False,
+                        help="Enable detailed classification metrics (Accuracy, Precision, Recall, F1-Score, PR AUC)")
+    parser.add_argument("--model-selection-metric", type=str, default="roc_auc",
+                        choices=['roc_auc', 'f1_score', 'accuracy'],
+                        help="Metric to use for model selection and checkpoint saving")
 
     args = parser.parse_args()
 

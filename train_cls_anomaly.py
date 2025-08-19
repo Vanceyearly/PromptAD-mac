@@ -72,7 +72,7 @@ def fit(model,
         for (data, mask, label, name, img_type, perlin_data_list, aug_mask_list) in data_progress:
             aa = 1
 
-            if True:
+            if False:
                 # 保存图片
                 save_dir = './saved_images_1'
                 if os.path.exists(save_dir):
@@ -272,7 +272,7 @@ def str2bool(v):
 def get_args():
     parser = argparse.ArgumentParser(description='Anomaly detection')
     parser.add_argument('--dataset', type=str, default='mvtec_dtd', choices=['mvtec', 'visa', 'mvtec_dtd'])
-    parser.add_argument('--class_name', type=str, default='cable')
+    parser.add_argument('--class_name', type=str, default='wood')
 
     parser.add_argument('--img-resize', type=int, default=240)
     parser.add_argument('--img-cropsize', type=int, default=240)

@@ -190,6 +190,7 @@ class CLIP(nn.Module):
         self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
 
         text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
+        self.text = text
         self.transformer = text.transformer
         self.vocab_size = text.vocab_size
         self.token_embedding = text.token_embedding
@@ -226,9 +227,10 @@ class CLIP(nn.Module):
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
         return F.normalize(x, dim=-1) if normalize else x
 
-    def encode_text_full(self, text, normalize: bool = False):
+    def encode_text_full(self, text_embeddings, normalize: bool = False):
         # 返回pooled, tokens, text_feature1, text_feature2
-        pooled, tokens, text_feature1, text_feature2 = self.textual(text)
+
+        pooled, tokens, text_feature1, text_feature2 = self.text(text_embeddings)
         if normalize:
             pooled = F.normalize(pooled, dim=-1)
             if text_feature1 is not None:
@@ -262,6 +264,22 @@ class CLIP(nn.Module):
         x = x + self.positional_embedding.to(cast_dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x, attn_mask=self.attn_mask)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        x = x[torch.arange(x.shape[0]), original_tokens.argmax(dim=-1)] @ self.text_projection
+        return F.normalize(x, dim=-1) if normalize else x
+    
+    def encode_text_embeddings_full(self, text_embeddings, original_tokens, normalize: bool = False):
+        cast_dtype = self.transformer.get_cast_dtype()
+
+        x = text_embeddings.to(cast_dtype)  # [batch_size, n_ctx, d_model]
+
+        x = x + self.positional_embedding.to(cast_dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+
+        x = self.transformer(x, attn_mask=self.attn_mask)
+
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)

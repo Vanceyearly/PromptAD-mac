@@ -101,7 +101,8 @@ def load_checkpoint(model, checkpoint_path, strict=True):
         state_dict = convert_to_custom_text_state_dict(state_dict)
     resize_pos_embed(state_dict, model)
 
-    incompatible_keys = model.load_state_dict(state_dict, strict=strict)
+    # incompatible_keys = model.load_state_dict(state_dict, strict=strict)
+    incompatible_keys = model.load_state_dict(state_dict, strict=False)
     return incompatible_keys
 
 

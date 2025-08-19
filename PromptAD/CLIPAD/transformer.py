@@ -788,6 +788,18 @@ class TextTransformer(nn.Module):
         )
         self.ln_final = norm_layer(width)
 
+
+        @torch.no_grad()
+        def hook_t1(module, input, output):
+            self.mid_feature1 = output.permute(1, 0, 2)[:, 1:, :]
+
+        @torch.no_grad()
+        def hook_t2(module, input, output):
+            self.mid_feature2 = output.permute(1, 0, 2)[:, 1:, :]
+
+        self.transformer.resblocks[2].register_forward_hook(hook_t1)
+        self.transformer.resblocks[7].register_forward_hook(hook_t2)
+
         self.register_buffer('attn_mask', self.build_attention_mask(), persistent=False)
 
         self.init_parameters()
@@ -834,6 +846,20 @@ class TextTransformer(nn.Module):
     def _repeat(self, t, N: int):
         return t.reshape(1, 1, -1).repeat(N, 1, 1)
 
+    def encode_text_embeddings(self, text_embeddings, original_tokens, normalize: bool = False):
+        cast_dtype = self.transformer.get_cast_dtype()
+
+        x = text_embeddings.to(cast_dtype)  # [batch_size, n_ctx, d_model]
+
+        x = x + self.positional_embedding.to(cast_dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x, attn_mask=self.attn_mask)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        x = x[torch.arange(x.shape[0]), original_tokens.argmax(dim=-1)] @ self.text_projection
+        return F.normalize(x, dim=-1) if normalize else x
+
     def forward(self, text):
         cast_dtype = self.transformer.get_cast_dtype()
         seq_len = text.shape[1]
@@ -850,17 +876,7 @@ class TextTransformer(nn.Module):
         x = x.permute(1, 0, 2)  # NLD -> LND
 
         # 记录第3层和第8层的输出
-        text_feature1 = None
-        text_feature2 = None
-        for i, r in enumerate(self.transformer.resblocks):
-            if self.transformer.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(r, x, None, None, attn_mask)
-            else:
-                x = r(x, attn_mask=attn_mask)
-            if i == 2:
-                text_feature1 = x.permute(1, 0, 2).detach()  # LND->NLD
-            if i == 7:
-                text_feature2 = x.permute(1, 0, 2).detach()
+        x = self.transformer(x, attn_mask=attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         # x.shape = [batch_size, n_ctx, transformer.width]
@@ -876,7 +892,8 @@ class TextTransformer(nn.Module):
             pooled = pooled @ self.text_projection
 
         # 返回pooled, tokens, text_feature1, text_feature2
-        return pooled, tokens, text_feature1, text_feature2
+        # return pooled, tokens, text_feature1, text_feature2
+        return pooled, tokens, self.mid_feature1, self.mid_feature2
 
 
 class MultimodalTransformer(Transformer):

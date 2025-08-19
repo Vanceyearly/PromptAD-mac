@@ -33,6 +33,59 @@ def metric_cal_img(img_scores, gt_list, map_scores=None):
     return result_dict
 
 
+def metric_cal_img_classification(img_scores, gt_list, map_scores=None):
+    """
+    计算分类任务的综合指标，包括ROC AUC、F1-Score、Precision、Recall等
+    """
+    # calculate image-level ROC AUC score (与原函数相同的预处理)
+    max_map_scores = map_scores.reshape(map_scores.shape[0], -1).max(axis=1)
+    img_scores = 1.0 / (1.0 / max_map_scores + 1.0 / img_scores)
+    
+    gt_list = np.asarray(gt_list, dtype=int)
+    
+    # 计算ROC AUC
+    fpr, tpr, _ = roc_curve(gt_list, img_scores)
+    img_roc_auc = roc_auc_score(gt_list, img_scores)
+    
+    # 计算最佳F1分数和对应阈值
+    max_f1, best_threshold = calculate_max_f1(gt_list, img_scores)
+    
+    # 根据最佳阈值计算分类指标
+    predictions = (img_scores >= best_threshold).astype(int)
+    
+    # 计算基本分类指标
+    tp = np.sum((predictions == 1) & (gt_list == 1))
+    fp = np.sum((predictions == 1) & (gt_list == 0))
+    tn = np.sum((predictions == 0) & (gt_list == 0))
+    fn = np.sum((predictions == 0) & (gt_list == 1))
+    
+    # 计算各项指标
+    accuracy = (tp + tn) / (tp + fp + tn + fn) if (tp + fp + tn + fn) > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
+    # 计算PR AUC
+    precision_curve, recall_curve, _ = precision_recall_curve(gt_list, img_scores)
+    pr_auc = auc(recall_curve, precision_curve)
+
+    result_dict = {
+        'i_roc': img_roc_auc * 100,
+        'accuracy': accuracy * 100,
+        'precision': precision * 100,
+        'recall': recall * 100,
+        'f1_score': f1_score * 100,
+        'pr_auc': pr_auc * 100,
+        'best_threshold': best_threshold,
+        'tp': tp,
+        'fp': fp,
+        'tn': tn,
+        'fn': fn
+    }
+
+    return result_dict
+
+
 def metric_cal_pix(map_scores, gt_mask_list):
 
     gt_mask = np.asarray(gt_mask_list, dtype=int)
